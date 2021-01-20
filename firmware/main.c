@@ -61,6 +61,7 @@
 #include "nordic_common.h"
 #include "led_softblink.h"
 #include "ant_search_config.h"
+#include <math.h>
 
 uint8_t led_duty_cycle = 120;
 //mask_number used for pwm debugging
@@ -77,6 +78,7 @@ uint8_t soft_blink = 0;
 uint8_t motor_init_state;
 uint8_t motor_error_state;
 uint8_t motor_soc_state;
+bool motor_display_soc = false;
 
 #define BUTTON_DETECTION_DELAY APP_TIMER_TICKS(50)           /**< Delay from a GPIOTE event until a button is reported as pushed (in number of timer ticks). */
 #define BUTTON_PRESS_TIMEOUT APP_TIMER_TICKS(60 * 60 * 1000) // 1h to enter low power mode
@@ -112,6 +114,7 @@ uint8_t motor_soc_state;
 uint8_t ebike = 1;                                                     //ebike control as default                                                //ANT LEV ebike as a default
 uint8_t garmin = 0;                                                    //no garmin computer as a default
 uint8_t brake = 0;
+bool m_button_long_press = false;
 bool shutdown_flag = false;
 bool plus_minus_flag = false;
 NRF_BLE_GATT_DEF(m_gatt);           /**< GATT module instance. */
@@ -202,16 +205,19 @@ void disp_soc(void)
 void check_motor_init()
 {
   static bool soc_disp = true;
-
+  static bool key_disp = false;
+  //display SOC if standby key pressed and motor is on
+  if (motor_display_soc && motor_soc_state && key_disp && (motor_init_state == 1)) // display soc when STANDBY Key is pressed
+  {
+    disp_soc();
+    motor_display_soc = false;
+  }
   switch (motor_init_state)
   {
   case 0: //motor off
-    //indicate the motor SOC when motor turns off
-    if (!soc_disp && motor_soc_state) //display if soc>0
-    {
-      disp_soc();
-      soc_disp = true;
-    }
+
+    key_disp = false;
+
     break;
   case 1: //motor on
 
@@ -222,12 +228,12 @@ void check_motor_init()
       nrf_delay_ms(1000);
       soft_blink = led_softblink_uninit(); // turn off the soft_blink led
       nrf_delay_ms(1000);
-      disp_soc();
       soc_disp = false;
+      key_disp = true;
     }
     break;
   case 2: //motor initializing
-  
+
     for (int i = 0; i < 5; i++)
     {
       led_pwm_on(R_LED | B_LED, 100, 0, 5, 0); // start soft_blink led, 0 for no timer
@@ -243,7 +249,6 @@ void check_motor_init()
     break;
   }
   //check for motor errors
-  
 
   switch (motor_error_state)
   {
@@ -414,7 +419,6 @@ APP_TIMER_DEF(m_timer_button_long_press_timeout);
 
 button_pins_t m_buttons_wait_to_send = 0;
 bool m_timer_buttons_send_running = false;
-bool m_button_long_press = false;
 
 //set default  old ant ID for reset;
 
@@ -517,7 +521,7 @@ void ant_lev_evt_handler(ant_lev_profile_t *p_profile, ant_lev_evt_t event)
     break;
 
   case ANT_LEV_PAGE_3_UPDATED:
-    motor_soc_state = p_profile->page_3.battery_soc / 10; //0 to 10
+    motor_soc_state = round(p_profile->page_3.battery_soc / 10); //0 to 10
     break;
 
   case ANT_LEV_PAGE_4_UPDATED:
@@ -723,18 +727,15 @@ static void timer_button_long_press_timeout_handler(void *p_context)
     // shutdown the remote
     plus_minus_flag = true; // reset and start again;
   }
-
-  m_button_long_press = true; //needed for app_release long press actions
-
   if (nrf_gpio_pin_read(STANDBY__PIN) == 0)
 
   {
     //turn motor power on/off
-
+    m_button_long_press = true;
     buttons_send_page16(&m_ant_lev, STANDBY__PIN, m_button_long_press);
   }
 
-  // m_button_long_press = true; //needed for app_release long press actions
+  m_button_long_press = true; //needed for app_release long press actions
 }
 
 static void button_event_handler(uint8_t pin_no, uint8_t button_action)
@@ -744,6 +745,7 @@ static void button_event_handler(uint8_t pin_no, uint8_t button_action)
   switch (button_action)
   {
   case APP_BUTTON_RELEASE: //process the button actions
+
     if (button_pin == MINUS__PIN)
     {
       if (plus_minus_flag)
@@ -751,6 +753,10 @@ static void button_event_handler(uint8_t pin_no, uint8_t button_action)
 
       if (ebike)
         buttons_send_page16(&m_ant_lev, button_pin, m_button_long_press);
+    }
+    else if (button_pin == STANDBY__PIN)
+    {                           //display the battery SOC
+      motor_display_soc = true; //flag needed due to interrupt priority
     }
     else if (button_pin == PLUS__PIN)
     {
@@ -766,55 +772,7 @@ static void button_event_handler(uint8_t pin_no, uint8_t button_action)
       if (garmin)
         buttons_send_pag73(&m_antplus_controls, button_pin, 0);
     }
-    else if (button_pin == STANDBY__PIN)
-    {
-      //the shutdown command is also needed here as the button release will wake up the board
-      //go to power off mode
 
-      if (!m_button_long_press)
-      {
-        //start of PWM test code to measure led current
-        if (!soft_blink)
-        {
-          uint32_t led_mask;
-          if (led_duty_cycle > 20)
-          {
-
-            switch (mask_number)
-            {
-            case (0):
-              led_mask = P_LED; //pwr
-              break;
-            case (1):
-              led_mask = R_LED; //red
-              break;
-            case (2):
-              led_mask = G_LED; //green
-              break;
-            case (3):
-              led_mask = B_LED; //blue
-              break;
-            }
-            if (led_duty_cycle == 120)
-              led_pwm_on(led_mask, 255, 254 - 1, 1, 2000); // seconds on
-            else
-              led_pwm_on(led_mask, led_duty_cycle, led_duty_cycle - 1, 1, 1000);
-
-            led_duty_cycle -= 20;
-          }
-          else
-          {
-            if (mask_number == 3)
-              mask_number = -1;
-            mask_number += 1;
-            led_duty_cycle = 120;
-          }
-        }
-        // end of pwm test code
-        //turn off the lights (short press ) or turn on/off the power (long press)
-        //buttons_send_page16(&m_ant_lev, button_pin, m_button_long_press);
-      }
-    }
     m_button_long_press = false; //reset the long press timer
 
     //reset the button timers
